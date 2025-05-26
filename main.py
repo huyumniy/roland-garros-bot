@@ -473,6 +473,8 @@ async def get_seat(page, amount, adspower_id, browser_id):
                         return False
                     random_seats_arr = random.choice(filtered_seats)
                     for seat_id in random_seats_arr:
+                        spinner = await custom_wait(page, "body:not(:has(#spinner-background))", timeout=10)
+                            if not spinner: break
                         seat = await check_for_element(page, f'polygon[class="polygon"][id="{seat_id}"]', debug=True)
                         if not seat: break
                         await seat.mouse_move()
