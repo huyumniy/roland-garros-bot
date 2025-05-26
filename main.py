@@ -7,6 +7,7 @@ import sys, os
 import threading
 import socket
 import nodriver as uc
+
 # from nodriver.cdp.network import delete_cookies
 import sounddevice as sd
 import soundfile as sf
@@ -16,17 +17,115 @@ from colorama import init, Fore
 import speech_recognition
 import pydub
 import textwrap
-from datetime import datetime, timedelta
 from filtration import filter_seats
 from utils.sheetsApi import get_data_from_google_sheets
+import nodriver as uc
+import logging
+import asyncio
+from nodriver import cdp
+import itertools
+from asyncio import iscoroutine, iscoroutinefunction
 
+logger = logging.getLogger("uc.connection")
 
-TIME_FROM_START = datetime.now()
-TIME_TO_WAIT = TIME_FROM_START + timedelta(minutes=5)
 pydub.AudioSegment.converter = os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe")
 print(os.path.join(os.getcwd(), "ffmpeg", "bin", "ffmpeg.exe"))
 init(autoreset=True)
 accounts = []
+
+
+async def listener_loop(self):
+    while True:
+        try:
+            msg = await asyncio.wait_for(
+                self.connection.websocket.recv(), self.time_before_considered_idle
+            )
+        except asyncio.TimeoutError:
+            self.idle.set()
+            # breathe
+            # await asyncio.sleep(self.time_before_considered_idle / 10)
+            continue
+        except (Exception,) as e:
+            # break on any other exception
+            # which is mostly socket is closed or does not exist
+            # or is not allowed
+
+            logger.debug(
+                "connection listener exception while reading websocket:\n%s", e
+            )
+            break
+
+        if not self.running:
+            # if we have been cancelled or otherwise stopped running
+            # break this loop
+            break
+
+        # since we are at this point, we are not "idle" anymore.
+        self.idle.clear()
+
+        message = json.loads(msg)
+        if "id" in message:
+            # response to our command
+            if message["id"] in self.connection.mapper:
+                # get the corresponding Transaction
+                tx = self.connection.mapper[message["id"]]
+                logger.debug("got answer for %s", tx)
+                # complete the transaction, which is a Future object
+                # and thus will return to anyone awaiting it.
+                tx(**message)
+                self.connection.mapper.pop(message["id"])
+        else:
+            # probably an event
+            try:
+                event = cdp.util.parse_json_event(message)
+                event_tx = uc.connection.EventTransaction(event)
+                if not self.connection.mapper:
+                    self.connection.__count__ = itertools.count(0)
+                event_tx.id = next(self.connection.__count__)
+                self.connection.mapper[event_tx.id] = event_tx
+            except Exception as e:
+                logger.info(
+                    "%s: %s  during parsing of json from event : %s"
+                    % (type(e).__name__, e.args, message),
+                    exc_info=True,
+                )
+                continue
+            except KeyError as e:
+                logger.info("some lousy KeyError %s" % e, exc_info=True)
+                continue
+            try:
+                if type(event) in self.connection.handlers:
+                    callbacks = self.connection.handlers[type(event)]
+                else:
+                    continue
+                if not len(callbacks):
+                    continue
+                for callback in callbacks:
+                    try:
+                        if iscoroutinefunction(callback) or iscoroutine(callback):
+                            await callback(event)
+                        else:
+                            callback(event)
+                    except Exception as e:
+                        logger.warning(
+                            "exception in callback %s for event %s => %s",
+                            callback,
+                            event.__class__.__name__,
+                            e,
+                            exc_info=True,
+                        )
+                        raise
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                raise
+            continue
+        
+#call this after imported nodriver
+#uc_fix(*nodriver module*)
+def uc_fix(uc: uc):
+    uc.core.connection.Listener.listener_loop = listener_loop
+
 
 async def get_court(page, desired_time=None, desired_courts=None):
     try:
@@ -474,12 +573,14 @@ async def get_seat(page, amount, adspower_id, browser_id):
                     random_seats_arr = random.choice(filtered_seats)
                     for seat_id in random_seats_arr:
                         spinner = await custom_wait(page, "body:not(:has(#spinner-background))", timeout=10)
-                            if not spinner: break
+                        if not spinner: break
                         seat = await check_for_element(page, f'polygon[class="polygon"][id="{seat_id}"]', debug=True)
                         if not seat: break
                         await seat.mouse_move()
                         time.sleep(.2)
                         await seat.mouse_click()
+                        spinner = await custom_wait(page, "body:not(:has(#spinner-background))", timeout=10)
+                        if not spinner: break
                         add_button = await custom_wait(page, "a[class='bt-main orange-aa w-inline-block']", timeout=3)
                         if add_button: await add_button.click()
                         # await get_stadion_ticket(page)
@@ -526,7 +627,7 @@ async def check_for_elements(page, selector, debug=False):
 async def main(browser_id, browsers_amount, proxy_list=None,
     adspower=None, adspower_id=None, google_sheets_data_link=None,
     google_sheets_accounts_link=None):
-    global accounts, TIME_FROM_START, TIME_TO_WAIT
+    global accounts
     try:
         link = 'https://tickets.rolandgarros.com/en/'
 
@@ -580,8 +681,7 @@ async def main(browser_id, browsers_amount, proxy_list=None,
                 browser_part = f"Browser: {adspower_id if adspower_id else browser_id}"
                 text = f"CAPTCHA"
                 message = "\n".join([user_part + " " + browser_part, text])
-                if datetime.now() > TIME_TO_WAIT:
-                    send_slack_message(message)
+                send_slack_message(message)
                 # print('trying to delete cookies')
                 # delete_cookies('datadome')
                 print(Fore.YELLOW + f"Browser {adspower_id if adspower_id else browser_id}: 403!\n")
@@ -711,6 +811,7 @@ async def main(browser_id, browsers_amount, proxy_list=None,
                                 time.sleep(2)
                                 await custom_wait(page, '.stadium-image', timeout=5)
                                 while True:
+                                    time.sleep(1)
                                     if not await check_for_element(page, '.stadium-image', debug=True): break
                                     try:
                                         desired_categories = []
@@ -933,8 +1034,8 @@ def is_port_open(host, port):
 
 
 if __name__ == "__main__":
+    uc_fix(uc)
     eel.init('gui')
-
     port = 8000
     while True:
         try:
